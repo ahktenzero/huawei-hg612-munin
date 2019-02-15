@@ -1,0 +1,521 @@
+#!/usr/local/bin/perl
+# -*- perl -*-
+
+=head1 NAME
+
+hg612_ - Plugin for graphing various stats from a Huawei HG612 VDSL router.
+
+=head1 CONFIGURATION
+
+=over
+
+=item  password
+
+Access password for the telnet interface. Default is "admin"
+
+=item host
+
+IP or hostname to connect to. Default is 192.168.1.2
+
+=item host_name
+
+Host name to use in results. Defaults to "hg612".
+
+=back
+
+=head1 USAGE
+
+This plugin will connect to a Huawei HG612 VDSL router and retrieve data about
+the VDSL connection. The router needs to have the unlocked firmware installed
+and either be connected to the local network on the secondary LAN port or
+configured to allow access to the admin interface on the primary LAN port. The
+output will differ depending on the plugin link name.
+
+The available options are:
+
+=over
+
+=item hg612_atm1
+
+Traffic over the atm1 interface
+
+=item hg612_atm1_uptime
+
+Uptime for the atm1 interface
+
+=item hg612_current_speed
+
+Current sync speeds
+
+=item hg612_errors
+
+CRC, FEC and HEC errors for upstream and downstream
+
+=item hg612_interleaving
+
+Interleave depth
+
+=item hg612_max_speed
+
+Maximum attainable sync speeds
+
+=item hg612_ptm1
+
+Traffic over the ptm1 interface
+
+=item hg612_ptm1_uptime
+
+Uptime for the ptm1 interface
+
+=item hg612_pwr
+
+Aggregate TX power
+
+=item hg612_snr
+
+SNR margin for upstream and downstream
+
+=item hg612_sync_speed
+
+Maximum and attainable sync speeds
+
+=item hg612_vdsl_attenuation
+
+Line attenuation
+
+=back
+
+=head1 AUTHOR
+
+James TD Smith <ahktenzero@mohorovi.cc>
+
+=head1 LICENSE
+
+GPL v3 or later.
+
+=cut
+
+#%# family=contrib
+
+use Carp;
+use Munin::Plugin;
+use strict;
+use Data::Dumper;
+use feature ":5.10";
+use Fcntl qw(:flock SEEK_SET);
+use List::MoreUtils qw(:all);
+
+#need_multigraph();
+
+my $ret = undef;
+
+if (! eval "require Net::Telnet") {
+    $ret = "Net::Telnet not found";
+}
+
+die $ret if $ret;
+
+my $host = exists $ENV{host} ? $ENV{host} : '192.168.1.2';
+my $password = exists $ENV{password} ? $ENV{password} : "admin";
+my $hostname = exists $ENV{host_name} ? $ENV{host_name} : "hg612";
+
+# Results are good for 5 mins. Might need to add a knob to control this if
+# people are fetching more frequently.
+my $STALE_TIME = 5 * 60;
+
+# Override state file name to allow sharing between variants
+set_state_name("hg612");
+
+# Section separators
+my $INFO_START = "======info======\n";
+my $PBPARAMS_START = "======pbparams======\n";
+my $STATS_START = "======stats======\n";
+my $ATM1_START = "======atm1======\n";
+my $PTM1_START = "======ptm1======\n";
+
+=head2 fetch_data
+
+Fetch the data from the router
+
+=cut
+sub fetch_data {
+
+    my $atprompt = '/ATP>$/';
+    my $prompt = '/\# $/';
+    my $conn = Net::Telnet->new(Prompt => $atprompt);
+
+    $conn->open($host) or die "Failed to connect to host $host: $!";
+
+    $conn->waitfor(m/Welcome Visiting Huawei  Home Gateway/);
+    $conn->login("admin", $password);
+
+    # Start busybox shell
+    $conn->prompt($prompt);
+    $conn->print("sh");
+
+    my @data = ();
+    # Retrieve data from router. Add some headers to break up the results.
+    push @data, $INFO_START;
+    push @data, $conn->cmd("xdslcmd info --show");
+    push @data, $PBPARAMS_START;
+    push @data, $conn->cmd("xdslcmd info --pbParams");
+    push @data, $STATS_START;
+    push @data, $conn->cmd("xdslcmd info --stats");
+    push @data, $ATM1_START;
+    push @data, $conn->cmd("ifconfig atm1");
+    push @data, $PTM1_START;
+    push @data, $conn->cmd("ifconfig ptm1");
+
+    $conn->prompt($atprompt);
+    $conn->print("exit");
+    $conn->print("exit");
+
+    return \@data;
+}
+
+=head2 get_data
+
+Get the current data from the router. This may be fetched directly if necessary,
+or loaded from disk.
+
+=cut
+sub get_data {
+    my $needsfetch = 0;
+    my $statefh;
+
+    # Check if the result file exists and if we need to update it
+    if (!-f $Munin::Plugin::statefile) {
+	open($statefh, ">", $Munin::Plugin::statefile)
+	    or die "Cannot open state file $Munin::Plugin::statefile: $!";
+	flock($statefh, LOCK_EX) or die "Cannot lock state file: $!";
+	$needsfetch = 1;
+    } else {
+	open($statefh, "+<", $Munin::Plugin::statefile)
+	    or die "Cannot open state file $Munin::Plugin::statefile: $!";
+	flock($statefh, LOCK_EX) or die "Cannot lock state file: $!";
+	my ($size, $mtime) = (stat($statefh))[7,9];
+	if ($size == 0 || time() - $mtime > $STALE_TIME) {
+	    $needsfetch = 1;
+	}
+    }
+
+    my $data = [];
+
+    # Fetch data from the router
+    if ($needsfetch) {
+	$data = fetch_data();
+	print { $statefh } $_ for @$data;
+    } else {
+	seek($statefh, 0, SEEK_SET);
+	while (my $line = <$statefh>) {
+	    push @$data, $line;
+	}
+    }
+
+    flock($statefh, LOCK_UN)
+	or die "Cannot unlock state file";
+    close($statefh);
+
+    return $data;
+}
+
+=head2 get_vdsl_bands
+
+Get the list of VDSL bands (for per-band attenuation, SNR, power etc).
+
+=cut
+sub get_vdsl_bands {
+    my $data = $_[0];
+    my @bands = grep /VDSL Band Status/, @$data;
+    my $bandslist = $bands[0];
+    $bandslist =~ s/^\s+VDSL Band Status\s+//;
+    my @bandnames = split(/\s+/, $bandslist);
+    return @bandnames;
+}
+
+=head2 graph_config
+
+Return the graph configuration for the selected variant
+
+=cut
+sub graph_config {
+    my $variant = $_[0];
+
+    print "host_name $hostname\n";
+    given ($variant) {
+	when (/^[ap]tm1$/) {
+	    print "graph_category network\n";
+	    print "graph_title $variant traffic\n";
+	    print "graph_args --base 1000\n";
+	    print "graph_vlabel bytes per \$\{graph_period\}\n";
+	    print "down.label received\n";
+	    print "down.type DERIVE\n";
+	    print "down.min 0\n";
+	    print "down.cdef down,8,*\n";
+	    print "down.draw AREA\n";
+	    print "up.label sent\n";
+	    print "up.type DERIVE\n";
+	    print "up.info Traffic of the $variant interface.\n";
+	    print "up.min 0\n";
+	    print "up.cdef up,8,*\n";
+	}
+	when (/^[ap]tm1_uptime/) {
+	    print "graph_category system\n";
+	    print "graph_title $variant Uptime in days\n";
+	    print "graph_args --base 1000 -l 0\n";
+	    print "graph_vlabel VDSL Uptime in days\n";
+	    print "graph_scale no\n";
+	    print "uptime.label Uptime in days\n";
+	    print "uptime.draw AREA\n";
+	}
+	when ("current_speed") {
+	    print "graph_category speed\n";
+	    print "graph_title Sync Speed\n";
+	    print "graph_args --base 1000\n";
+	    print "graph_vlabel Speed (bps)\n";
+	    print "graph_scale yes\n";
+	    print "graph_order downstream upstream\n";
+	    print "downstream.label Downstream\n";
+	    print "downstream.draw AREA\n";
+	    print "upstream.label Upstream\n";
+	    print "upstream.draw AREA\n";
+	}
+	when ("errors") {
+	    print "graph_category line\n";
+	    print "graph_title Errors\n";
+	    print "graph_args --base 1000\n";
+	    print "graph_vlabel errors down (-) / up (+) per \$\{graph_period\}\n";
+	    print "graph_scale no\n";
+
+	    print "downcrc.label CRC errors\n";
+	    print "downcrc.type DERIVE\n";
+	    print "downcrc.graph no\n";
+	    print "upcrc.label CRC errors\n";
+	    print "upcrc.type DERIVE\n";
+	    print "upcrc.negative downcrc\n";
+	    print "upcrc.info Errors received\n";
+
+	    print "downfec.label FEC errors\n";
+	    print "downfec.type DERIVE\n";
+	    print "downfec.graph no\n";
+	    print "upfec.label FEC errors\n";
+	    print "upfec.type DERIVE\n";
+	    print "upfec.negative downfec\n";
+	    print "upfec.info Errors received\n";
+
+	    print "downhec.label HEC errors\n";
+	    print "downhec.type DERIVE\n";
+	    print "downhec.graph no\n";
+	    print "uphec.label HEC errors\n";
+	    print "uphec.type DERIVE\n";
+	    print "uphec.negative downhec\n";
+	    print "uphec.info Errors received\n";
+	}
+	when ("interleaving") {
+	    print "graph_category line\n";
+	    print "graph_title Interleave Depth\n";
+	    print "graph_args --base 1000\n";
+	    print "graph_vlabel Interleave Depth\n";
+	    print "graph_scale no\n";
+	    print "graph_order upstream downstream\n";
+	    print "downstream.label Downstream\n";
+	    print "downstream.draw LINE\n";
+	    print "upstream.label Upstream\n";
+	    print "upstream.draw LINE\n";
+	}
+	when ("max_speed") {
+	    print "graph_category speed\n";
+	    print "graph_title Maximum Attainable Speed\n";
+	    print "graph_args --base 1000\n";
+	    print "graph_vlabel Max Speed (bps)\n";
+	    print "graph_scale yes\n";
+	    print "graph_order downstream upstream\n";
+	    print "downstream.label Downstream\n";
+	    print "downstream.draw AREA\n";
+	    print "upstream.label Upstream\n";
+	    print "upstream.draw AREA\n";
+	}
+	when ("pwr") {
+	    print "graph_category line\n";
+	    print "graph_title Aggregate Tx Power\n";
+	    print "graph_args --base 1000\n";
+	    print "graph_vlabel Actual Aggregate Tx Power (dBm)\n";
+	    print "graph_scale no\n";
+	    print "downstream.label Downstream\n";
+	    print "downstream.draw LINE\n";
+	    print "upstream.label Upstream\n";
+	    print "upstream.draw LINE\n";
+	}
+	when ("snr") {
+	    print "graph_category line\n";
+	    print "graph_title SNR Margin (dB)\n";
+	    print "graph_args --base 1000\n";
+	    print "graph_vlabel SNR Margin (dB)\n";
+	    print "graph_scale no\n";
+	    print "graph_order upstream downstream\n";
+	    print "downstream.label Downstream\n";
+	    print "downstream.draw LINE\n";
+	    print "upstream.label Upstream\n";
+	    print "upstream.draw LINE\n";
+	}
+	when ("sync_speed") {
+	    print "graph_category speed\n";
+	    print "graph_title Attainable vs Current Sync Speed\n";
+	    print "graph_args --base 1000\n";
+	    print "graph_vlabel Sync Rate Actual (-) Attainable (+)\n";
+	    print "graph_scale yes\n";
+	    print "downstream.label Downstream\n";
+	    print "downstream.draw LINE\n";
+	    print "downstream.graph no\n";
+	    print "upstream.label Upstream\n";
+	    print "upstream.draw LINE\n";
+	    print "upstream.graph no\n";
+	    print "maxdownstream.label Downstream\n";
+	    print "maxdownstream.draw AREA\n";
+	    print "maxdownstream.negative downstream\n";
+	    print "maxupstream.label Upstream\n";
+	    print "maxupstream.draw AREA\n";
+	    print "maxupstream.negative upstream\n";
+	}
+	when ("vdsl_attenuation") {
+	    print "graph_category line\n";
+	    print "graph_title Line Attenuation (dB)\n";
+	    print "graph_args --base 1000\n";
+	    print "graph_vlabel Line Attenuation (dB)\n";
+	    print "graph_scale no\n";
+
+	    # Need to get the VDSL band names from the output
+	    my $data =  get_data();
+	    my @bandnames = get_vdsl_bands($data);
+	    print "$_.label \"$_\"\n" for @bandnames;
+	}
+    }
+}
+
+sub output_values {
+    my ($variant, $data) = @_;
+    given ($variant) {
+	when (/[ap]tm1$/) {
+	    my $header = $variant eq "atm1" ? $ATM1_START : $PTM1_START;
+	    my $start = first_index { $_ eq $header } @$data;
+
+	    # Check if there are results for the interface. If it's not
+	    # configured there will be an error message from ifconfig
+	    if (@$data[$start+1] =~ m/^ifconfig:/) {
+		exit 1;
+	    } else {
+		@$data[$start+6] =~ m/
+		    RX bytes:(?<rxbytes>[0-9]+).*TX bytes:(?<txbytes>[0-9]+)
+		/x;
+		print "down.value $+{rxbytes}\n";
+		print "up.value $+{txbytes}\n";
+	    }
+	}
+	when (/[ap]tm1_uptime$/)  {
+	    my @times = grep /Since Link time/, @$data;
+
+	    if ($#times == -1) {
+		print "uptime.value 0";
+	    } else {
+		$times[0] =~ m/
+		    =\ ((?<days>[0-9]+)\ days?)?
+		    \ ?((?<hours>[0-9]+)\ hours?)?
+		    \ ?((?<mins>[0-9]+)\ min)?
+		    \ ?((?<secs>[0-9]+)\ sec)?
+		/x;
+		my $uptime = ((0 + $+{days}) * 86400 + (0 + $+{hours}) * 3600 +
+		    (0 + $+{mins}) * 60 + (0 + $+{secs})) / 86400.0;
+		print "uptime.value $uptime\n";
+	    }
+	}
+	when ("current_speed")  {
+	    extract_speeds($data, qr/^(Path|Channel|Bearer):/);
+	}
+	when ("errors") {
+	    extract_split($data, qr/^CRC:/, "upcrc", "downcrc");
+	    extract_split($data, qr/^FEC:/, "upfec", "downfec");
+	    extract_split($data, qr/^HEC:/, "uphec", "downhec");
+	}
+	when ("interleaving") {
+	    extract_split($data, qr/^D:/);
+	}
+	when ("max_speed") {
+	    extract_speeds($data, qr/^Max:/);
+	}
+	when ("pwr") {
+	    extract_split($data, qr/^Pwr:/);
+	}
+	when ("snr") {
+	    extract_split($data, qr/^SNR:/);
+	}
+	when ("sync_speed") {
+	    extract_speeds($data, qr/^Max:/, "maxupstream", "maxdownstream");
+	    extract_speeds($data, qr/^(Path|Channel|Bearer):/);
+	}
+	when ("vdsl_attenuation") {
+	    my @bandnames = get_vdsl_bands($data);
+	    my @attenuation = grep /Line Attenuation\(dB\)/, @$data;
+	    my $line_att = $attenuation[0];
+	    $line_att =~ s/\s*Line Attenuation\(dB\):\s*//;
+	    my @att_values = split(/\s+/, $line_att);
+	    pairwise { print "${a}.value $b\n" } @bandnames, @att_values;
+	}
+    }
+}
+
+=head2 extract_split
+
+Helper to find and parse a line containing a prefix followed by two values,
+first downstream, second upstream. This covers a lot of the error reporting, SNR
+and power details and various other things.
+
+=cut
+sub extract_split {
+    my ($data, $match, $uplabel, $downlabel) = @_;
+    $uplabel = "upstream" unless defined $uplabel;
+    $downlabel = "downstream" unless defined $downlabel;
+
+    my @lines = grep /$match/, @$data;
+    my @values = split(/\s+/, $lines[0]);
+
+    print "${downlabel}.value $values[1]\n";
+    print "${uplabel}.value $values[2]\n";
+}
+
+=head2 extract_speeds
+
+Helper to find and parse a line containing upstream and downstream speeds.
+
+=cut
+sub extract_speeds {
+    my ($data, $match, $uplabel, $downlabel) = @_;
+
+    $uplabel = "upstream" unless defined $uplabel;
+    $downlabel = "downstream" unless defined $downlabel;
+
+    my @speeds = grep /$match/, @$data;
+    $speeds[0] =~ m/
+        .*?(Upstream\ rate\ =\ (?<upstream>[0-9]+)\ Kbps),
+	\ (Downstream\ rate\ =\ (?<downstream>[0-9]+)\ Kbps)
+    /x;
+
+    print "${downlabel}.value $+{downstream}\n";
+    print "${uplabel}.value $+{upstream}\n";
+}
+
+my $variant = $0;
+$variant =~ s/.*hg612_([a-z0-9_]*)/$1/;
+
+die "Unable to determine selected variant" unless defined $variant;
+
+given ($ARGV[0]) {
+    when ("config") {
+	graph_config($variant);
+    };
+    when ("fetch") {
+	output_values($variant, get_data());
+    };
+    default {
+	output_values($variant, get_data());
+    };
+};
