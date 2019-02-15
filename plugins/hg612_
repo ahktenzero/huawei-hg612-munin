@@ -1,4 +1,4 @@
-#!/usr/local/bin/perl
+#!/usr/bin/env perl
 # -*- perl -*-
 
 =head1 NAME
@@ -259,9 +259,9 @@ sub graph_config {
 	    print "up.min 0\n";
 	    print "up.cdef up,8,*\n";
 	}
-	when (/^[ap]tm1_uptime/) {
+	when (/^(?<interface>[ap]tm1)_uptime/) {
 	    print "graph_category system\n";
-	    print "graph_title $variant Uptime in days\n";
+	    print "graph_title $+{interface} Uptime in days\n";
 	    print "graph_args --base 1000 -l 0\n";
 	    print "graph_vlabel VDSL Uptime in days\n";
 	    print "graph_scale no\n";
@@ -387,7 +387,7 @@ sub graph_config {
 	    # Need to get the VDSL band names from the output
 	    my $data =  get_data();
 	    my @bandnames = get_vdsl_bands($data);
-	    print "$_.label \"$_\"\n" for @bandnames;
+	    print "$_.label $_\n" for @bandnames;
 	}
     }
 }
