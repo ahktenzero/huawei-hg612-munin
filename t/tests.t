@@ -5,18 +5,19 @@ use Data::Dumper;
 use Cwd;
 
 # Set some enviroment vars
-$ENV{MUNIN_PLUGSTATE} = getcwd() . "/testdata";
+$ENV{MUNIN_PLUGSTATE} = getcwd() . "/testdata/default";
 $ENV{MUNIN_MASTER_IP} = "127.0.0.1";
 
 # test config output, check it corresponds to output of original plugins
-
 sub test_config {
     my ($command, $expected) = @_;
 
-    # hg612_atm1
     my ($config, $stderr, $exit) = capture {
 	system("./plugins/$command", "config");
     };
+
+    # Touch state file so we don't have to fetch
+    utime(undef, undef, getcwd() . "/testdata/default/hg612-");
 
     if ($exit) {
 	diag(
@@ -30,7 +31,6 @@ sub test_config {
     is($config, $expected, "$command configuration");
 }
 
-# hg612_atm1
 test_config(
     "hg612_atm1",
 <<'EOF'
@@ -65,7 +65,6 @@ uptime.label Uptime in days
 uptime.draw AREA
 EOF
 );
-
 
 test_config(
     "hg612_current_speed",
@@ -243,9 +242,6 @@ maxupstream.negative upstream
 EOF
 );
 
-# Touch state file so we don't have to fetch
-utime(undef, undef, getcwd() . "/testdata/hg612-");
-
 test_config(
     "hg612_vdsl_attenuation",
 <<'EOF'
@@ -267,5 +263,117 @@ EOF
 );
 
 # test fetch output (with several input files)
+sub test_fetch {
+    my ($command, $expected, $testdataset, $expectedExit) = @_;
+
+    $testdataset = "default" unless defined $testdataset;
+    $expectedExit = 0 unless defined $expectedExit;
+
+    $ENV{MUNIN_PLUGSTATE} = getcwd() . "/testdata/$testdataset";
+
+    # Touch state file so we don't have to fetch
+    utime(undef, undef, getcwd() . "/testdata/$testdataset/hg612-");
+
+    my ($result, $stderr, $exit) = capture {
+	system("./plugins/$command", "fetch");
+    };
+
+    if ($exit ne $expectedExit) {
+	diag(
+	    sprintf(
+		"\nCommand: %s\n\nSTDOUT:\n\n%s\n\nSTDERR:\n\n%s\n\nexit:%d\n\n",
+		"./plugins/$command fetch", $result, $stderr, $exit
+	    )
+	);
+    }
+
+    is($result, $expected, "$command fetch output");
+}
+
+test_fetch("hg612_atm1", "", undef, 256);
+
+test_fetch(
+    "hg612_atm1_uptime",
+<<EOF
+uptime.value 1.32748842592593
+EOF
+);
+
+test_fetch(
+    "hg612_current_speed",
+<<EOF
+upstream.value 6987000
+downstream.value 24998000
+EOF
+);
+
+test_fetch(
+    "hg612_errors",
+<<EOF
+upcrc.value 210
+downcrc.value 0
+upfec.value 0
+downfec.value 19730
+uphec.value 0
+downhec.value 0
+EOF
+);
+
+test_fetch(
+    "hg612_interleaving",
+<<EOF
+upstream.value 1
+downstream.value 4
+EOF
+);
+
+test_fetch(
+    "hg612_max_speed",
+<<EOF
+upstream.value 6987000
+downstream.value 39584000
+EOF
+);
+
+test_fetch(
+    "hg612_ptm1",
+<<EOF
+down.value 2045808671
+up.value 851813310
+EOF
+);
+
+test_fetch(
+    "hg612_ptm1_uptime",
+<<EOF
+uptime.value 1.32748842592593
+EOF
+);
+
+test_fetch(
+    "hg612_pwr",
+<<'EOF'
+upstream.value 4.1
+downstream.value 11.5
+EOF
+);
+
+test_fetch(
+    "hg612_snr",
+<<'EOF'
+upstream.value 6.1
+downstream.value 13.8
+EOF
+);
+
+test_fetch(
+    "hg612_sync_speed",
+<<'EOF'
+maxupstream.value 6987000
+maxdownstream.value 39584000
+upstream.value 6987000
+downstream.value 24998000
+EOF
+);
 
 done_testing;

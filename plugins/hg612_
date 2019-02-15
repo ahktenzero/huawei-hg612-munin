@@ -405,7 +405,10 @@ sub output_values {
 		exit 1;
 	    } else {
 		@$data[$start+6] =~ m/
-		    RX bytes:(?<rxbytes>[0-9]+).*TX bytes:(?<txbytes>[0-9]+)
+		    .*
+		    (RX\ bytes:(?<rxbytes>[0-9]+))
+		    .*
+		    (TX\ bytes:(?<txbytes>[0-9]+))
 		/x;
 		print "down.value $+{rxbytes}\n";
 		print "up.value $+{txbytes}\n";
@@ -443,10 +446,10 @@ sub output_values {
 	    extract_speeds($data, qr/^Max:/);
 	}
 	when ("pwr") {
-	    extract_split($data, qr/^Pwr:/);
+	    extract_split($data, qr/^Pwr\(dBm\):/);
 	}
 	when ("snr") {
-	    extract_split($data, qr/^SNR:/);
+	    extract_split($data, qr/^SNR \(dB\):/);
 	}
 	when ("sync_speed") {
 	    extract_speeds($data, qr/^Max:/, "maxupstream", "maxdownstream");
@@ -471,15 +474,17 @@ and power details and various other things.
 
 =cut
 sub extract_split {
-    my ($data, $match, $uplabel, $downlabel) = @_;
+    my ($data, $match, $uplabel, $downlabel, $convertKb) = @_;
     $uplabel = "upstream" unless defined $uplabel;
     $downlabel = "downstream" unless defined $downlabel;
 
     my @lines = grep /$match/, @$data;
-    my @values = split(/\s+/, $lines[0]);
+    my $cleaned = $lines[0];
+    $cleaned =~ s/$match//;
+    my @values = split(/\s+/, $cleaned);
 
-    print "${downlabel}.value $values[1]\n";
     print "${uplabel}.value $values[2]\n";
+    print "${downlabel}.value $values[1]\n";
 }
 
 =head2 extract_speeds
@@ -499,8 +504,10 @@ sub extract_speeds {
 	\ (Downstream\ rate\ =\ (?<downstream>[0-9]+)\ Kbps)
     /x;
 
-    print "${downlabel}.value $+{downstream}\n";
-    print "${uplabel}.value $+{upstream}\n";
+    my $upstream = $+{upstream} * 1000;
+    my $downstream = $+{downstream} * 1000;
+    print "${uplabel}.value $upstream\n";
+    print "${downlabel}.value $downstream\n";
 }
 
 my $variant = $0;
